@@ -11,6 +11,12 @@ from functools import partial
 print = partial(print, flush=True)
 import pickle
 import stat_utils
+from mpi4py import MPI
+
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()
+size = comm.Get_size()
+
 
 @struct.dataclass
 class system:
@@ -115,13 +121,16 @@ def sampling(system_data, random_data):
     walker_data, samples = lax.scan(scanned_fun, walker_data, jnp.arange(random_numbers.shape[0]))
     return samples, walker_data['rdf_hist_avg'], walker_data['n_accepted'] / random_numbers.shape[0] 
 
-def driver(beta, n_particles, box, pot_fun, n_samples=1000, r_max=None, n_bins=None, step_size=1., seed=0):
+def driver(beta, n_particles, box, pot_fun, n_samples=1000, r_max=None, n_bins=None, step_size=1., seed=0, save_samples=False):
+    if rank == 0:
+        print(f'# Number of MPI ranks: {size}\n#')
+
     if n_bins is None:
-        n_bins = 20
+        n_bins = 50
     if r_max is None:
         r_max = 5 * box.length / n_particles
     system_data = system(beta=beta, pot_fun=pot_fun, box=box, n_particles=n_particles, n_bins=n_bins, r_max=r_max)
-    key = random.PRNGKey(seed)
+    key = random.PRNGKey(rank + seed)
     key, random_key = random.split(key)
     random_numbers = random.uniform(random_key, shape=(n_samples,))
     key, random_key = random.split(key)
@@ -130,10 +139,27 @@ def driver(beta, n_particles, box, pot_fun, n_samples=1000, r_max=None, n_bins=N
     random_indices = random.randint(random_key, shape=(n_samples,), minval=0, maxval=n_particles)
     random_data = (random_numbers, random_proposals, random_indices)
     samples, rdf_avg, accepted = sampling(system_data, random_data)
-    print(stat_utils.blocking_analysis(None, samples[1] / n_particles, neql=0, printQ=True))
-    with open('samples.pkl', 'wb') as f:
-        pickle.dump(samples, f)
-    np.savetxt('rdf_avg.dat', rdf_avg)
+    
+    # mpi averaging
+    global_energies = None
+    global_rdf = None
+    if rank == 0:
+        global_energies = np.zeros(n_samples, dtype=np.float64)
+        global_rdf = np.zeros(n_bins, dtype=np.float64)
+    comm.Reduce([samples[1], MPI.DOUBLE], [global_energies, MPI.DOUBLE], op=MPI.SUM, root=0)
+    comm.Reduce([rdf_avg, MPI.DOUBLE], [global_rdf, MPI.DOUBLE], op=MPI.SUM, root=0)
+    
+    if rank == 0:
+        global_energies /= size
+        global_rdf /= size
+        stat_utils.blocking_analysis(None, global_energies / n_particles, neql=100, printQ=True)
+        print(f'Acceptance ratio: {accepted}')
+        np.savetxt('rdf_avg.dat', global_rdf)
+    
+    if save_samples:
+        with open(f'samples_{rank}.pkl', 'wb') as f:
+            pickle.dump(samples, f)
+        
     return samples, rdf_avg, accepted
 
 if __name__ == '__main__':
@@ -142,11 +168,9 @@ if __name__ == '__main__':
     pot_fun = lambda x: jnp.exp(-jnp.abs(x)**2/2)
     #pot_fun = lambda x: jnp.abs(x)**2
     n_particles = 50
-    n_samples = 400000
-    beta = 10.
-    samples, rdf_avg, accepted = driver(beta, n_particles, box, pot_fun, n_samples=n_samples, step_size=1.)
-    print(accepted)
-    print(rdf_avg)
+    n_samples = 100000
+    beta = 50.
+    samples, rdf_avg, accepted = driver(beta, n_particles, box, pot_fun, n_samples=n_samples, step_size=0.5)
 
     #walker_data = calculate_energy(walker_data, system_data)
     #print(walker_data)
