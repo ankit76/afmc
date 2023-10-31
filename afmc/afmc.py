@@ -1,195 +1,326 @@
 import os
-#os.environ['JAX_ENABLE_X64'] = 'True'
-os.environ['JAX_PLATFORM_NAME'] = 'cpu'
-from itertools import product
-import numpy as np
-#from scipy.fft import fft, ifft, ifftshift, ifftn
-from jax.numpy.fft import fft, ifft, ifftshift, ifftn, fftshift, fftn
-from jax import lax, jit, value_and_grad, random, vmap,numpy as jnp
-import jax
+
+os.environ["JAX_ENABLE_X64"] = "True"
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+import pickle
 from functools import partial
-import matplotlib.pyplot as plt
+from itertools import product
+from typing import Any, Callable
 
-def blocking_analysis(weights, energies, neql = 0, printQ=False, writeBlockedQ=False):
-  nSamples = weights.shape[0] - neql
-  weights = weights[neql:]
-  energies = energies[neql:]
-  weightedEnergies = np.multiply(weights, energies)
-  meanEnergy = weightedEnergies.sum() / weights.sum()
-  if printQ:
-    print(f'#\n# Mean energy: {meanEnergy:.8e}')
-    print('# Block size    # of blocks         Mean                Error')
-  blockSizes = np.array([ 1, 2, 5, 10, 20, 50, 100, 200, 300, 400, 500, 1000, 10000 ])
-  prevError = 0.
-  plateauError = None
-  for i in blockSizes[blockSizes < nSamples/2.]:
-    nBlocks = nSamples//i
-    blockedWeights = np.zeros(nBlocks)
-    blockedEnergies = np.zeros(nBlocks)
-    for j in range(nBlocks):
-      blockedWeights[j] = weights[j*i:(j+1)*i].sum()
-      blockedEnergies[j] = weightedEnergies[j*i:(j+1)*i].sum() / blockedWeights[j]
-    v1 = blockedWeights.sum()
-    v2 = (blockedWeights**2).sum()
-    mean = np.multiply(blockedWeights, blockedEnergies).sum() / v1
-    error = (np.multiply(blockedWeights, (blockedEnergies - mean)**2).sum() / (v1 - v2 / v1) / (nBlocks - 1))**0.5
-    if writeBlockedQ:
-      np.savetxt(f'samples_blocked_{i}.dat', np.stack((blockedWeights, blockedEnergies)).T)
-    if printQ:
-      print(f'  {i:5d}           {nBlocks:6d}       {mean:.8e}       {error:.6e}')
-    if error < 1.05 * prevError and plateauError is None:
-      plateauError = max(error, prevError)
-    prevError = error
+import jax
+import numpy as np
+import stat_utils
+from flax import struct
+from jax import jit, lax
+from jax import numpy as jnp
+from jax import random, value_and_grad, vmap
 
-  if printQ:
-    if plateauError is not None:
-      print(f'# Stocahstic error estimate: {plateauError:.6e}\n#')
+# from scipy.fft import fft, ifft, ifftshift, ifftn
+from jax.numpy.fft import fft, fftn, fftshift, ifft, ifftn, ifftshift
+from mpi4py import MPI
 
-  return meanEnergy, plateauError
+comm = MPI.COMM_WORLD
+size = comm.Get_size()
+rank = comm.Get_rank()
 
-@jit
-def symmetrize_1d(fields):
-  n_fields_1d = fields.shape[0]
-  fields = fields.at[:n_fields_1d//2].set(jnp.conj(jnp.flip(fields[n_fields_1d//2+1:])))
-  return fields
 
-@jit
-def symmetrize_2d(fields):
-  n_fields_1d = fields.shape[0]
-  fields = fields.at[:,:n_fields_1d//2].set(jnp.conj(jnp.flip(fields[:,n_fields_1d//2+1:])))
-  fields = fields.at[:n_fields_1d//2,n_fields_1d//2].set(jnp.conj(jnp.flip(fields[n_fields_1d//2+1:,n_fields_1d//2])))
-  return fields
-
-@jit
-def symmetrize(fields):
-  n_fields_1d = fields.shape[0]
-  fields = fields.at[:,:,:n_fields_1d//2].set(jnp.conj(jnp.flip(fields[:,:,n_fields_1d//2+1:])))
-  fields = fields.at[:,:n_fields_1d//2,n_fields_1d//2].set(jnp.conj(jnp.flip(fields[:,n_fields_1d//2+1:,n_fields_1d//2])))
-  fields = fields.at[:n_fields_1d//2,n_fields_1d//2,n_fields_1d//2].set(jnp.conj(jnp.flip(fields[n_fields_1d//2+1:,n_fields_1d//2,n_fields_1d//2])))
-  return fields
+@struct.dataclass
+class system:
+    beta: float
+    phi: Any = struct.field(pytree_node=False)
+    grid: Any = struct.field(pytree_node=False)
+    n_particles: int = struct.field(pytree_node=False)
 
 
 @jit
-def calc_denom_sample(fields_g, sign_mask, n_particles):
-  fields_r = ifftn(ifftshift(fields_g), norm="forward")
-  #jax.debug.print('fields_g:\n{}', fields_g)
-  #jax.debug.print('fields_r:\n{}', jnp.real(fftshift(fields_r)))
-  #jax.debug.print('int fields_r:\n{}', jnp.sum(jnp.exp(-1.j * fields_r) * dV) / dV / jnp.size(fields_g))
-  #jax.debug.print('denom_sample: {}', (jnp.sum(jnp.exp(-fields_r * 1.j) / jnp.size(fields_g)))**N)
+def calc_fluctuation(fields_g, system_data):
+    r_grid = system_data.grid.get_r_grid()
+    unique_fields = fields_g[jnp.array(system_data.grid.unique_indices)]
+    unique_k_points = jnp.array(system_data.grid.unique_k_points)
+    fields_r = jnp.sum(
+        vmap(
+            lambda g, sigma_g: 2.0
+            * sigma_g.real
+            * jnp.cos(2.0 * jnp.pi * jnp.sum(g * r_grid, axis=1))
+            - 2.0 * sigma_g.imag * jnp.sin(2.0 * jnp.pi * jnp.sum(g * r_grid, axis=1)),
+            in_axes=(0, 0),
+        )(unique_k_points, unique_fields),
+        axis=0,
+    )
+    return jnp.sum(jnp.exp(-fields_r * 1.0j) / jnp.size(fields_r))
 
-  #return jnp.log(jnp.sum(jnp.cos(-fields_r) / jnp.size(fields_g))) * N
-  return jnp.log(jnp.sum(jnp.exp(fields_r * sign_mask) / jnp.size(fields_g))) * n_particles
-  #return (jnp.sum(jnp.exp(-fields_r * 1.j) / jnp.size(fields_g)))**N
+
+# @partial(jit, static_argnums=(2,))
+@jit
+def calc_pot_ene(fields_g, system_data):
+    return (
+        -jnp.sum(jnp.abs(fields_g) ** 2 / system_data.phi) / 2 / system_data.beta**2
+    )
+
 
 @jit
-def calc_vol_int(fields_g):
-  fields_r = ifftn(ifftshift(fields_g), norm="forward")
-  i_g = fftshift(fftn(jnp.exp(-1.j * fields_r)) / jnp.size(fields_g))
-  return i_g
+def calc_rdf(fields_g, system_data):
+    r_grid = system_data.grid.get_r_grid()
+    unique_fields = fields_g[jnp.array(system_data.grid.unique_indices)]
+    unique_k_points = jnp.array(system_data.grid.unique_k_points)
+    fields_r = jnp.sum(
+        vmap(
+            lambda g, sigma_g: 2.0
+            * sigma_g.real
+            * jnp.cos(2.0 * jnp.pi * jnp.sum(g * r_grid, axis=1))
+            - 2.0 * sigma_g.imag * jnp.sin(2.0 * jnp.pi * jnp.sum(g * r_grid, axis=1)),
+            in_axes=(0, 0),
+        )(unique_k_points, unique_fields),
+        axis=0,
+    )
+    eigr = vmap(lambda g: jnp.exp(1.0j * jnp.pi * 2.0 * jnp.sum(g * r_grid, axis=1)))(
+        unique_k_points
+    )
+    i_g = (
+        jnp.einsum("i,ji->j", jnp.exp(-fields_r * 1.0j), eigr)
+        / jnp.size(fields_r)
+        * jnp.einsum("i,ji->j", jnp.exp(-fields_r * 1.0j), jnp.conj(eigr))
+        / jnp.size(fields_r)
+        / (jnp.sum(jnp.exp(-fields_r * 1.0j) / jnp.size(fields_r))) ** 2
+    )
+    return i_g
 
 
+# @partial(jit, static_argnums=(0,))
 @jit
-def calc_pot_ene(fields_g, phi_g):
-  return jnp.sum(jnp.abs(fields_g)**2 / jnp.abs(phi_g))
+def initialize_fields(system_data):
+    fields_data = {}
+    fields_data["fields"] = 0.0j * system_data.phi
+    fields_data["fluctuation"] = calc_fluctuation(fields_data["fields"], system_data)
+    fields_data["energy"] = calc_pot_ene(fields_data["fields"], system_data)
+    fields_data["phase"] = jnp.exp(
+        1.0j
+        * (
+            system_data.n_particles
+            * jnp.angle(fields_data["fluctuation"])
+            % (2 * jnp.pi)
+        )
+    )
+    fields_data["rdf"] = calc_rdf(fields_data["fields"], system_data)
+    fields_data["n_accepted"] = 0
+    return fields_data
 
+
+# @partial(jit, static_argnums=(3,))
 @jit
-def direct_sampling(phi_g, beta, L, N, mask, sign_mask, n_samples_proxy, seed=0):
-  nkpts_1d = phi_g.shape[0]
-  nkpts_fields = jnp.count_nonzero(mask)
-  dL = L / nkpts_1d
-  dV = dL**3
-  phi_0 = phi_g[nkpts_1d//2, nkpts_1d//2, nkpts_1d//2]
+def metropolis_step(fields_data, move, random_num, system_data):
+    fields = fields_data["fields"]
+    fluctuation = fields_data["fluctuation"]
+    new_fields = system_data.grid.symmetric_update(fields, move)
+    new_fluctuation = calc_fluctuation(new_fields, system_data)
+    # jax.debug.print('new_fluctuation: {}', new_fluctuation)
+    log_exp_factor_ratio = (
+        (-jnp.abs(new_fields[move[0]]) ** 2 + jnp.abs(fields[move[0]]) ** 2)
+        / system_data.beta
+        / system_data.phi[move[0]]
+    )
+    # jax.debug.print('log_exp_factor_ratio: {}', log_exp_factor_ratio)
+    log_fluctuation_ratio = system_data.n_particles * jnp.log(
+        jnp.abs(new_fluctuation) / jnp.abs(fluctuation)
+    )
+    # jax.debug.print('log_fluctuation_ratio: {}', log_fluctuation_ratio)
+    log_b_ratio = log_exp_factor_ratio + log_fluctuation_ratio
+    # jax.debug.print('log_b_ratio: {}', log_b_ratio)
+    # jax.debug.print('fluc_ratio: {}', (jnp.abs(new_fluctuation) / jnp.abs(fluctuation))**5)
+    fields_data["fields"] = lax.cond(
+        log_b_ratio > jnp.log(random_num), lambda x: new_fields, lambda x: fields, 0
+    )
+    fields_data["fluctuation"] = lax.cond(
+        log_b_ratio > jnp.log(random_num),
+        lambda x: new_fluctuation,
+        lambda x: fluctuation,
+        0,
+    )
+    fields_data["energy"] = calc_pot_ene(fields_data["fields"], system_data)
+    fields_data["rdf"] = calc_rdf(fields_data["fields"], system_data)
+    fields_data["phase"] = jnp.exp(
+        1.0j
+        * (
+            (system_data.n_particles * jnp.angle(fields_data["fluctuation"]))
+            % (2 * jnp.pi)
+        )
+    )
+    fields_data["n_accepted"] += log_b_ratio > jnp.log(random_num)
+    return fields_data
 
-  # carry: key
-  def scanned_fun(carry, x):
-    fields_g = 0.j * phi_g
-    carry, subkey = random.split(carry)
-    fields_g_r = (beta * jnp.abs(phi_g[:,:,nkpts_1d//2:]))**0.5 * random.normal(subkey, shape=(nkpts_1d, nkpts_1d, nkpts_1d//2+1))
-    carry, subkey = random.split(carry)
-    fields_g_i = (beta * jnp.abs(phi_g[:,:,nkpts_1d//2:]))**0.5 * random.normal(subkey, shape=(nkpts_1d, nkpts_1d, nkpts_1d//2+1))
-    fields_g = fields_g.at[:,:,nkpts_1d//2:].set(fields_g_r)
-    fields_g = fields_g.at[:,:,nkpts_1d//2:].add(1.j * fields_g_i)
-    fields_g = mask * symmetrize(fields_g)
-    fields_g = fields_g.at[nkpts_1d//2, nkpts_1d//2, nkpts_1d//2].set(0.j)
-    denom_sample = calc_denom_sample(fields_g, sign_mask, N)
-    i_g = calc_vol_int(fields_g)
-    #corr_sample = i_g * jnp.flip(i_g)
-    #corr_sample = corr_sample / corr_sample[nkpts_1d//2, nkpts_1d//2, nkpts_1d//2]
-    #fields_r = ifftn(ifftshift(fields_g), norm="forward")
-    #denom_sample = (jnp.sum(jnp.exp(-fields_r * 1.j)) * dV)**N
-    pot_ene_sample = - calc_pot_ene(fields_g, phi_g) / 4 / beta**2
-    return carry, (denom_sample, pot_ene_sample)
 
-  key = random.PRNGKey(seed)
-  n_samples = n_samples_proxy.shape[0]
-  _, (denom_samples, pot_ene_samples) = lax.scan(scanned_fun, key, jnp.arange(n_samples))
-  #jax.debug.print('denom_samples: {}', denom_samples)
-  #jax.debug.print('pot_ene_samples: {}', pot_ene_samples)
+# @partial(jit, static_argnums=(0,))
+@jit
+def sampling(system_data, random_data):
+    random_numbers, random_proposals, random_indices = random_data
 
-  #avg_pot_ene = jnp.sum(denom_samples * pot_ene_samples) / jnp.sum(denom_samples)
-  #avg_pot_ene += (N**2 * phi_0 / 2. - N / 2. + (nkpts_fields - 1) / 2 / beta)
-  return denom_samples, pot_ene_samples
-  #return avg_pot_ene / N, (denom_samples, pot_ene_samples)
+    def scanned_fun(carry, x):
+        random_num = random_numbers[x]
+        random_proposal = random_proposals[x]
+        random_index = random_indices[x]
+        move = (system_data.grid.get_grid_index(random_index), random_proposal)
+        # jax.debug.print('\niter: {}', x)
+        # jax.debug.print('random_index: {}', random_index)
+        # jax.debug.print('random_proposal: {}', random_proposal)
+        # jax.debug.print('random_num: {}', random_num)
+        # jax.debug.print('move: {}', move)
+        carry = metropolis_step(carry, move, random_num, system_data)
+        # jax.debug.print('field_data:\n{}\n', carry)
+        return carry, (
+            carry["fields"],
+            carry["energy"],
+            carry["phase"],
+            carry["fluctuation"],
+            carry["rdf"],
+        )
+
+    fields_data = initialize_fields(system_data)
+    fields_data, samples = lax.scan(
+        scanned_fun, fields_data, jnp.arange(random_numbers.shape[0])
+    )
+    return samples, fields_data["n_accepted"] / random_numbers.shape[0]
+
+
+def driver(
+    beta,
+    n_particles,
+    grid,
+    pot_g,
+    n_samples=1000,
+    step_size=0.1,
+    seed=0,
+    save_samples=False,
+):
+    if rank == 0:
+        print(f"# Number of MPI ranks: {size}\n#")
+
+    system_data = system(beta=beta, phi=pot_g, grid=grid, n_particles=n_particles)
+    key = random.PRNGKey(seed + rank)
+    key, random_key = random.split(key)
+    random_numbers = random.uniform(random_key, shape=(n_samples,))
+    key, random_key = random.split(key)
+    random_proposals_r = step_size * random.normal(random_key, shape=(n_samples,))
+    key, random_key = random.split(key)
+    random_proposals_i = step_size * random.normal(random_key, shape=(n_samples,))
+    random_proposals = random_proposals_r + 1.0j * random_proposals_i
+    key, random_key = random.split(key)
+    random_indices = random.randint(
+        random_key, shape=(n_samples,), minval=0, maxval=len(grid.unique_indices)
+    )
+    random_data = (random_numbers, random_proposals, random_indices)
+
+    # fields_data = initialize_fields(system_data)
+    # rdf_sample = calc_rdf(fields_data['fields'], system_data)
+    # exit()
+    samples, acceptance_ratio = sampling(system_data, random_data)
+
+    # mpi averaging
+    global_energies = None
+    global_phases = None
+    # global_rdf = None
+    if rank == 0:
+        global_energies = np.zeros(n_samples, dtype=samples[1].dtype)
+        global_phases = np.zeros(n_samples, dtype=samples[2].dtype)
+        # global_rdf = np.zeros(n_bins, dtype=np.float64)
+    comm.Reduce(
+        [samples[1], MPI.COMPLEX], [global_energies, MPI.COMPLEX], op=MPI.SUM, root=0
+    )
+    comm.Reduce(
+        [samples[2], MPI.COMPLEX], [global_phases, MPI.COMPLEX], op=MPI.SUM, root=0
+    )
+    # comm.Reduce([rdf_avg, MPI.DOUBLE], [
+    #            global_rdf, MPI.DOUBLE], op=MPI.SUM, root=0)
+
+    if rank == 0:
+        global_energies /= size
+        global_phases /= size
+        # global_rdf /= size
+        mean_energy, _ = stat_utils.blocking_analysis(
+            global_phases, global_energies / n_particles, neql=100, printQ=True
+        )
+        print(f"Acceptance ratio: {acceptance_ratio}")
+        # np.savetxt('rdf_avg.dat', global_rdf)
+
+        # constant terms in potential energy
+        nkpts_fields = len(grid.unique_indices) * 2
+        avg_phase = jnp.average(global_phases)
+        print(f"Average phase: {avg_phase}")
+        pot_e = (
+            mean_energy
+            + (
+                n_particles**2 * phi[grid.origin] / 2.0
+                - n_particles / 2.0
+                + nkpts_fields / 2 / beta
+            )
+            / n_particles
+        )
+        print(f"Potential energy: {pot_e}")
+
+        # rdf
+        r_points = jnp.linspace(1.0e-3, 1.0, 1000)
+        rhog_2_avg = jnp.einsum("ij,i->j", samples[4], global_phases) / jnp.sum(
+            global_phases
+        )
+        np.savetxt("rhog_2_avg.dat", rhog_2_avg.real)
+        # 1d
+        coskr = vmap(lambda g: jnp.cos(2.0 * jnp.pi * jnp.linalg.norm(g) * r_points))(
+            jnp.array(grid.unique_k_points)
+        )
+        rdf = (
+            2
+            * n_particles
+            * (n_particles - 1)
+            * jnp.einsum("gr,g->r", coskr, rhog_2_avg).real
+            + n_particles**2
+        ) / n_particles**2
+        # 3d
+        # singr = vmap(
+        #    lambda g: jnp.sin(2.0 * jnp.pi * jnp.linalg.norm(g) * r_points)
+        #    / r_points
+        #    / jnp.linalg.norm(g)
+        #    / 2.0
+        #    / jnp.pi
+        # )(jnp.array(grid.unique_k_points))
+        # rdf = (
+        #    n_particles
+        #    * (n_particles - 1)
+        #    * jnp.einsum("gr,g->r", singr, rhog_2_avg).real
+        #    + n_particles**2
+        #    # - n_particles
+        # ) / n_particles**2
+        np.savetxt("rdf_avg.dat", np.stack((r_points * grid.l, rdf)).T)
+
+    if save_samples:
+        with open(f"samples_{rank}.pkl", "wb") as f:
+            pickle.dump(samples, f)
+
+    return samples, acceptance_ratio
+
 
 if __name__ == "__main__":
-  #for beta in [ 1000., 100., 10., 1., 0.1, 0.01 ]:
-  nruns = 5
-  pot_ene = np.zeros(nruns)
-  for run in range(nruns):
-    for beta in [ 0.1 ]:
-      #beta = 0.001
-      L = 16.**(1/3)
-      rho = 1.
-      N = 16
+    import grids
 
-      nkpts = 7
-      kpts_1d = np.array([2 * n * np.pi/L for n in range(-nkpts//2+1, nkpts//2+1)])
-      kpts = np.array(list(product(kpts_1d, kpts_1d, kpts_1d))).reshape(nkpts, nkpts, nkpts, 3)
-      phi_1d = np.array([np.exp(-(2 * n * np.pi/L)**2 / 4) * np.pi**0.5 / L for n in range(-nkpts//2+1, nkpts//2+1)])
-      phi = np.einsum('i,j,k', phi_1d, phi_1d, phi_1d)
-
-      e_cut = 30.
-      g_cut = (e_cut)**0.5
-      mask = np.zeros((nkpts, nkpts, nkpts))
-      sign_mask = np.zeros((nkpts, nkpts, nkpts))+0.j      
-      for i in range(nkpts):
-        for j in range(nkpts):
-          for k in range(nkpts):
-            if np.linalg.norm(kpts[i,j,k]) < g_cut:
-              mask[i,j,k] = 1.
-            if phi[i,j,k] < 0:
-              sign_mask[i,j,k] = 1.
-            else:
-              sign_mask[i,j,k] = -1.j
-
-      phi_g = jnp.array(phi)
-      mask = jnp.array(mask)
-      n_samples = 10000
-      n_samples_proxy = jnp.zeros((n_samples))
-
-      denom_samples, pot_ene_samples = direct_sampling(phi_g, beta, L, N, mask, sign_mask, n_samples_proxy, seed=run)
-      denom_samples = np.array(denom_samples)
-      pot_ene_samples = np.array(pot_ene_samples)
-      #print(f'denom_samples: {denom_samples}')
-      n_large = n_samples
-      indices = np.argsort(-np.real(denom_samples))
-      sorted_denom = denom_samples[indices]
-      sorted_denom = np.exp(sorted_denom - np.real(sorted_denom[0]))
-      #print(f'sorted_denom: {sorted_denom}')
-      sorted_pot = pot_ene_samples[indices]
-      nkpts_1d = phi_g.shape[0]
-      nkpts_fields = jnp.count_nonzero(mask)
-      phi_0 = phi_g[nkpts_1d//2, nkpts_1d//2, nkpts_1d//2]
-      avg_pot_ene = np.sum(sorted_denom[:n_large] * sorted_pot[:n_large]) / np.sum(sorted_denom[:n_large]) + (N**2 * phi_0 / 2. - N / 2. + (nkpts_fields - 1) / 2 / beta)
-      #print(f'beta: {beta}, avg_pot_ene: {avg_pot_ene/N}')
-      pot_ene[run] = np.real(avg_pot_ene / N)
-
-      #avg_pot_ene, (denom_samples, pot_ene_samples) = direct_sampling(phi_g, beta, L, N, mask, n_samples_proxy, seed=3959)
-      #print(f'avg pot ene: {avg_pot_ene}')
-      #print(f'avg sign: {jnp.sum(denom_samples) / jnp.sum(jnp.abs(denom_samples))}')
-      #print(f'avg int: {jnp.sum(-denom_samples * pot_ene_samples * 4 * beta**2) / jnp.sum(denom_samples)}')
-      #print(f'beta nk: {-beta * (jnp.count_nonzero(mask)-1)}')
-
-  np.savetxt('pot_ene_samples.dat', pot_ene)
-  print(f'pot_ene: {np.mean(pot_ene)} +/- {np.std(pot_ene) / (nruns - 1)**0.5}')
-  
+    l = 50.0
+    beta = 4.0
+    rho = 1.0
+    n_particles = 50
+    e_cut = 10000.0
+    nkpts = 75
+    grid = grids.one_dimensional_grid((nkpts,), e_cut=e_cut, l=l, r_grid_spacing=0.01)
+    phi = jnp.array(
+        [
+            np.exp(-((2 * n * np.pi / l) ** 2) / 4) * np.pi**0.5 / l
+            for n in range(-nkpts // 2 + 1, nkpts // 2 + 1)
+        ]
+    )
+    n_samples = 400000
+    samples, acceptance_ratio = driver(
+        beta,
+        n_particles,
+        grid,
+        phi,
+        n_samples=n_samples,
+        step_size=0.02,
+        seed=101,
+        save_samples=True,
+    )
